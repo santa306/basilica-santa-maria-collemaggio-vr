@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Visore 3D - scene.gltf (WebXR / Oculus Rift)</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    width: 100%;
+    height: 100%;
+    background: #111;
+    font-family: Arial, Helvetica, sans-serif;
+  }
+  #info {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    color: #fff;
+    background: rgba(0,0,0,0.5);
+    padding: 8px 14px;
+    border-radius: 6px;
+    font-size: 13px;
+    z-index: 10;
+  }
+  #loading {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    color: #fff;
+    font-size: 18px;
+    z-index: 10;
+  }
+</style>
+</head>
+<body>
+
+<div id="info">Modello: scene.glb — Desktop: trascina col mouse per guardarti intorno, usa le freccette ↑↓←→ per camminare, clicca su un personaggio per farlo parlare. VR: joystick per muoverti, gira la testa per guardarti intorno, grilletto per far parlare i personaggi.</div>
+<div id="loading">Caricamento modello...</div>
+
+<!-- Three.js e moduli necessari (import map, versione via CDN) -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.161.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.161.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+  import * as THREE from "three";
+  import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+  import { VRButton } from "three/addons/webxr/VRButton.js";
+
+  let scene, camera, renderer, dolly, loadedModel;
+  const moveSpeed = 3; // metri al secondo
+  const clock = new THREE.Clock();
+  const keys = { forward: false, backward: false, left: false, right: false };
+
+  // --- Parametri regolabili per la posizione iniziale ---
+  const EYE_HEIGHT = 3;
+  const DOOR_DISTANCE = 5;      // distanza dalla porta (asse X in questo modello)
+  const DOOR_LATERAL_OFFSET = 4;  // spostamento laterale (asse Z in questo modello)
+
+  // Numero totale di alberi. Grazie all'InstancedMesh puoi aumentare
+  // questo valore parecchio (es. 60, 100) senza impatto significativo
+  // sulle performance: il numero di "draw call" resta fisso a 7.
+  const TREE_COUNT = 80;
+
+  // --- Stato per il controllo dello sguardo con mouse (click + trascina) ---
+  let isDragging = false;
+  let previousMouseX = 0;
+  let previousMouseY = 0;
+  let clickStartX = 0;
+  let clickStartY = 0;
+  let yaw = 0;
+  let pitch = 0;
+  const mouseSensitivity = 0.0025;
+  const PITCH_LIMIT = Math.PI / 2 - 0.05;
+  const CLICK_DRAG_THRESHOLD = 5;
+
+  // --- Audio dei personaggi ---
+  const audioFrancesco = new Audio("audio_francesco.m4a");
+  const audioGiada = new Audio("audio_giada.m4a");
+  let currentAudio = null;
+
+  audioFrancesco.addEventListener("ended", () => { if (currentAudio === audioFrancesco) currentAudio = null; });
+  audioGiada.addEventListener("ended", () => { if (currentAudio === audioGiada) currentAudio = null; });
+
+  function toggleAudio(audioElement) {
+    if (currentAudio === audioElement) {
+      audioElement.pause();
+      audioElement.currentTime = 0;
+      currentAudio = null;
+    } else {
+      if (currentAudio) {
+        currentAudio.pause();
+        currentAudio.currentTime = 0;
+      }
+      audioElement.currentTime = 0;
+      audioElement.play();
+      currentAudio = audioElement;
+    }
+  }
+
+  function identifyCharacter(object) {
+    let current = object;
+    while (current) {
+      const name = (current.name || "").toLowerCase();
+      if (name.includes("francesco")) return "francesco";
+      if (name.includes("giada")) return "giada";
+      if (name.includes("panchina") || name.includes("bench")) return "giada";
+      current = current.parent;
+    }
+    return null;
+  }
+
+  function handleCharacterHit(object) {
+    const character = identifyCharacter(object);
+    if (character === "francesco") toggleAudio(audioFrancesco);
+    else if (character === "giada") toggleAudio(audioGiada);
+  }
+
+  // --- Raycasting condiviso (click desktop + trigger VR) ---
+  const raycaster = new THREE.Raycaster();
+  const mouseVector = new THREE.Vector2();
+
+  function handleDesktopClick(event) {
+    if (!loadedModel) return;
+    mouseVector.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouseVector.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    raycaster.setFromCamera(mouseVector, camera);
+    const intersects = raycaster.intersectObject(loadedModel, true);
+    if (intersects.length > 0) handleCharacterHit(intersects[0].object);
+  }
+
+  const tempMatrix = new THREE.Matrix4();
+  function handleVRSelect(event) {
+    if (!loadedModel) return;
+    const controller = event.target;
+    tempMatrix.identity().extractRotation(controller.matrixWorld);
+    raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+    raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+    const intersects = raycaster.intersectObject(loadedModel, true);
+    if (intersects.length > 0) handleCharacterHit(intersects[0].object);
+  }
+
+  // ============================================================
+  // --- Ambiente: alberi con InstancedMesh (alte performance) ---
+  // ============================================================
+  // Definizione "a unità" (scaleFactor = 1) di ogni parte di ogni tipo
+  // di albero. localY è l'altezza del pezzo nello spazio locale
+  // dell'albero, PRIMA di applicare la scala casuale per-istanza.
+  const TREE_TYPE_DEFS = [
+    // Tipo 0: conifera
+    {
+      parts: [
+        { geometry: new THREE.CylinderGeometry(0.11, 0.15, 1.3, 8), localY: 0.65, color: 0x6b4423 },
+        { geometry: new THREE.ConeGeometry(1.05, 1.5, 8), localY: 1.75, color: 0x3f6e1f },
+        { geometry: new THREE.ConeGeometry(0.7, 1.2, 8), localY: 2.7, color: 0x3f6e1f }
+      ]
+    },
+    // Tipo 1: latifoglia (chioma sferica)
+    {
+      parts: [
+        { geometry: new THREE.CylinderGeometry(0.13, 0.18, 1.5, 8), localY: 0.75, color: 0x7a5230 },
+        { geometry: new THREE.SphereGeometry(1.1, 8, 6).scale(1, 0.85, 1) === undefined
+            ? null : (() => { const g = new THREE.SphereGeometry(1.1, 8, 6); g.scale(1, 0.85, 1); return g; })(),
+          localY: 2.35, color: 0x5a9c34 }
+      ]
+    },
+    // Tipo 2: slanciato, tipo cipresso
+    {
+      parts: [
+        { geometry: new THREE.CylinderGeometry(0.09, 0.12, 0.6, 8), localY: 0.3, color: 0x5c4028 },
+        { geometry: new THREE.ConeGeometry(0.45, 3.2, 8), localY: 2.2, color: 0x2e5c1a }
+      ]
+    }
+  ];
+
+  // Un InstancedMesh per ogni parte di ogni tipo (7 in totale: 3+2+2),
+  // capacità massima = TREE_COUNT (upper bound sicuro per qualsiasi tipo)
+  const instancedMeshesByType = TREE_TYPE_DEFS.map((typeDef) =>
+    typeDef.parts.map((part) => {
+      const material = new THREE.MeshStandardMaterial({ color: part.color });
+      const mesh = new THREE.InstancedMesh(part.geometry, material, TREE_COUNT);
+      mesh.count = 0; // aggiornato dopo aver piazzato gli alberi
+      return mesh;
+    })
+  );
+
+  const treeDummy = new THREE.Object3D();
+
+  function setTreeInstance(typeIndex, instanceIndexInType, x, z, floorY, scaleFactor, rotationY) {
+    const typeDef = TREE_TYPE_DEFS[typeIndex];
+    const meshes = instancedMeshesByType[typeIndex];
+
+    treeDummy.position.set(x, floorY, z);
+    treeDummy.rotation.set(0, rotationY, 0);
+    treeDummy.scale.set(scaleFactor, scaleFactor, scaleFactor);
+    treeDummy.updateMatrix();
+
+    for (let i = 0; i < typeDef.parts.length; i++) {
+      const localTranslation = new THREE.Matrix4().makeTranslation(0, typeDef.parts[i].localY, 0);
+      const finalMatrix = treeDummy.matrix.clone().multiply(localTranslation);
+      meshes[i].setMatrixAt(instanceIndexInType, finalMatrix);
+    }
+  }
+
+  // Sparge gli alberi in modo casuale, evitando l'edificio e il punto di partenza
+  function scatterTrees(box, floorY, spawnPoint, count) {
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+
+    const areaHalfX = size.x * 1.6 + 8;
+    const areaHalfZ = size.z * 1.6 + 8;
+    const buildingMarginX = size.x / 2 + 2.5;
+    const buildingMarginZ = size.z / 2 + 2.5;
+    const spawnExclusionRadius = 2.5;
+
+    const countPerType = [0, 0, 0];
+    let placed = 0;
+    let attempts = 0;
+    const maxAttempts = count * 20;
+
+    while (placed < count && attempts < maxAttempts) {
+      attempts++;
+
+      const x = center.x + (Math.random() * 2 - 1) * areaHalfX;
+      const z = center.z + (Math.random() * 2 - 1) * areaHalfZ;
+
+      const insideBuildingZone =
+        Math.abs(x - center.x) < buildingMarginX &&
+        Math.abs(z - center.z) < buildingMarginZ;
+      if (insideBuildingZone) continue;
+
+      const distFromSpawn = Math.hypot(x - spawnPoint.x, z - spawnPoint.z);
+      if (distFromSpawn < spawnExclusionRadius) continue;
+
+      const type = Math.floor(Math.random() * 3);
+      const scaleFactor = 0.75 + Math.random() * 0.7;
+      const rotationY = Math.random() * Math.PI * 2;
+
+      setTreeInstance(type, countPerType[type], x, z, floorY, scaleFactor, rotationY);
+      countPerType[type]++;
+      placed++;
+    }
+
+    // Imposta quante istanze disegnare per ogni parte, e segna le matrici da aggiornare
+    for (let t = 0; t < TREE_TYPE_DEFS.length; t++) {
+      for (const mesh of instancedMeshesByType[t]) {
+        mesh.count = countPerType[t];
+        mesh.instanceMatrix.needsUpdate = true;
+      }
+      instancedMeshesByType[t].forEach((mesh) => scene.add(mesh));
+    }
+  }
+
+  init();
+
+  function init() {
+    // Scena
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x8fc7ee);
+    scene.fog = new THREE.Fog(0x8fc7ee, 25, 140);
+
+    camera = new THREE.PerspectiveCamera(
+      70,
+      window.innerWidth / window.innerHeight,
+      0.01,
+      1000
+    );
+
+    dolly = new THREE.Group();
+    dolly.add(camera);
+    scene.add(dolly);
+
+    const hemiLight = new THREE.HemisphereLight(0x8fc7ee, 0x4a7c2a, 1.1);
+    scene.add(hemiLight);
+
+    const dirLight = new THREE.DirectionalLight(0xfff4e0, 1.9);
+    dirLight.position.set(8, 15, 6);
+    scene.add(dirLight);
+
+    // Prato: unico terreno visibile attorno all'edificio
+    const grassGeometry = new THREE.PlaneGeometry(20, 20);
+    const grassMaterial = new THREE.MeshStandardMaterial({ color: 0x5a9c34 });
+    const grass = new THREE.Mesh(grassGeometry, grassMaterial);
+    grass.rotation.x = -Math.PI / 2;
+    scene.add(grass);
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.xr.enabled = true;
+    document.body.appendChild(renderer.domElement);
+    document.body.appendChild(VRButton.createButton(renderer));
+
+    const controllerA = renderer.xr.getController(0);
+    controllerA.addEventListener("selectstart", handleVRSelect);
+    dolly.add(controllerA);
+
+    const controllerB = renderer.xr.getController(1);
+    controllerB.addEventListener("selectstart", handleVRSelect);
+    dolly.add(controllerB);
+
+    renderer.domElement.addEventListener("mousedown", onMouseDown);
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+
+    const loader = new GLTFLoader();
+    loader.load(
+      "scene.glb",
+      function (gltf) {
+        const model = gltf.scene;
+        loadedModel = model;
+        scene.add(model);
+
+        const box = new THREE.Box3().setFromObject(model);
+        const size = box.getSize(new THREE.Vector3());
+        const center = box.getCenter(new THREE.Vector3());
+
+        const floorY = box.min.y;
+
+        grass.position.y = floorY - 0.03;
+        const grassSize = Math.max(size.x, size.z) * 6;
+        grass.scale.set(grassSize / 20, grassSize / 20, 1);
+
+        const spawnPoint = new THREE.Vector3(
+          center.x + DOOR_DISTANCE,
+          floorY,
+          center.z + DOOR_LATERAL_OFFSET
+        );
+
+        scatterTrees(box, floorY, spawnPoint, TREE_COUNT);
+
+        dolly.position.copy(spawnPoint);
+
+        camera.position.set(0, EYE_HEIGHT, 0);
+        camera.lookAt(center.x, floorY + EYE_HEIGHT, center.z);
+
+        const initialEuler = new THREE.Euler().setFromQuaternion(camera.quaternion, "YXZ");
+        yaw = initialEuler.y;
+        pitch = initialEuler.x;
+
+        const maxDim = Math.max(size.x, size.y, size.z);
+        camera.near = maxDim / 1000;
+        camera.far = maxDim * 100;
+        camera.updateProjectionMatrix();
+
+        document.getElementById("loading").style.display = "none";
+      },
+      function (xhr) {
+        if (xhr.total) {
+          const percent = ((xhr.loaded / xhr.total) * 100).toFixed(0);
+          document.getElementById("loading").textContent =
+            "Caricamento modello... " + percent + "%";
+        }
+      },
+      function (error) {
+        document.getElementById("loading").textContent =
+          "Errore nel caricamento di scene.glb (controlla che il file sia nella stessa cartella).";
+        console.error("Errore GLTFLoader:", error);
+      }
+    );
+
+    window.addEventListener("resize", onWindowResize);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+
+    renderer.setAnimationLoop(animate);
+  }
+
+  function onWindowResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+
+  function onMouseDown(event) {
+    if (renderer.xr.isPresenting) return;
+    isDragging = true;
+    previousMouseX = event.clientX;
+    previousMouseY = event.clientY;
+    clickStartX = event.clientX;
+    clickStartY = event.clientY;
+  }
+
+  function onMouseMove(event) {
+    if (!isDragging) return;
+    const deltaX = event.clientX - previousMouseX;
+    const deltaY = event.clientY - previousMouseY;
+    previousMouseX = event.clientX;
+    previousMouseY = event.clientY;
+    yaw -= deltaX * mouseSensitivity;
+    pitch -= deltaY * mouseSensitivity;
+    pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, pitch));
+    camera.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, "YXZ"));
+  }
+
+  function onMouseUp(event) {
+    if (isDragging) {
+      const movedDistance = Math.hypot(event.clientX - clickStartX, event.clientY - clickStartY);
+      if (movedDistance < CLICK_DRAG_THRESHOLD) {
+        handleDesktopClick(event);
+      }
+    }
+    isDragging = false;
+  }
+
+  function onKeyDown(event) {
+    switch (event.code) {
+      case "ArrowUp":    keys.forward = true; break;
+      case "ArrowDown":  keys.backward = true; break;
+      case "ArrowLeft":  keys.left = true; break;
+      case "ArrowRight": keys.right = true; break;
+    }
+  }
+
+  function onKeyUp(event) {
+    switch (event.code) {
+      case "ArrowUp":    keys.forward = false; break;
+      case "ArrowDown":  keys.backward = false; break;
+      case "ArrowLeft":  keys.left = false; break;
+      case "ArrowRight": keys.right = false; break;
+    }
+  }
+
+  const forwardVector = new THREE.Vector3();
+  const rightVector = new THREE.Vector3();
+
+  function updateKeyboardMovement(delta) {
+    if (!keys.forward && !keys.backward && !keys.left && !keys.right) return;
+    camera.getWorldDirection(forwardVector);
+    forwardVector.y = 0;
+    forwardVector.normalize();
+    rightVector.crossVectors(forwardVector, camera.up).normalize();
+    const distance = moveSpeed * delta;
+    if (keys.forward)  dolly.position.addScaledVector(forwardVector, distance);
+    if (keys.backward) dolly.position.addScaledVector(forwardVector, -distance);
+    if (keys.right)    dolly.position.addScaledVector(rightVector, distance);
+    if (keys.left)     dolly.position.addScaledVector(rightVector, -distance);
+  }
+
+  const vrForward = new THREE.Vector3();
+  const vrRight = new THREE.Vector3();
+
+  function updateVRMovement(delta) {
+    const session = renderer.xr.getSession();
+    if (!session) return;
+    for (const source of session.inputSources) {
+      if (!source.gamepad) continue;
+      const axes = source.gamepad.axes;
+      if (axes.length < 4) continue;
+      const stickX = axes[2];
+      const stickY = axes[3];
+      if (Math.abs(stickX) < 0.15 && Math.abs(stickY) < 0.15) continue;
+      camera.getWorldDirection(vrForward);
+      vrForward.y = 0;
+      vrForward.normalize();
+      vrRight.crossVectors(vrForward, camera.up).normalize();
+      const distance = moveSpeed * delta;
+      dolly.position.addScaledVector(vrForward, -stickY * distance);
+      dolly.position.addScaledVector(vrRight, stickX * distance);
+    }
+  }
+
+  function animate() {
+    const delta = clock.getDelta();
+    if (renderer.xr.isPresenting) {
+      updateVRMovement(delta);
+    } else {
+      updateKeyboardMovement(delta);
+    }
+    renderer.render(scene, camera);
+  }
+</script>
+
+</body>
+</html>
