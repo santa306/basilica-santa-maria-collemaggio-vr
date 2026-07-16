@@ -57,7 +57,7 @@
   import { VRButton } from "three/addons/webxr/VRButton.js";
 
   let scene, camera, renderer, dolly, loadedModel;
-  const moveSpeed = 5; // metri al secondo
+  const moveSpeed = 7; // metri al secondo (aumentata ulteriormente)
   const clock = new THREE.Clock();
   const keys = { forward: false, backward: false, left: false, right: false };
 
@@ -193,11 +193,15 @@
 
   // ============================================================
   // --- Pannello di debug visibile DENTRO al visore ---
-  // Utile temporaneamente per capire i numeri reali se l'altezza
-  // dovesse ancora risultare sbagliata. Si può rimuovere in seguito.
+  // OTTIMIZZATO: si aggiorna solo 4 volte al secondo (non ogni frame),
+  // perché ridisegnare il canvas e ricaricare la texture sulla GPU ad
+  // ogni frame in VR (90 volte al secondo, per due occhi) è costoso
+  // ed era la causa più probabile del lag.
   // ============================================================
   let debugCanvas, debugCtx, debugTexture, debugMesh;
   const debugWorldPos = new THREE.Vector3();
+  let debugUpdateTimer = 0;
+  const DEBUG_UPDATE_INTERVAL = 0.25; // secondi tra un aggiornamento e l'altro
 
   function createDebugHUD() {
     debugCanvas = document.createElement("canvas");
@@ -210,14 +214,17 @@
     });
     const geometry = new THREE.PlaneGeometry(0.55, 0.275);
     debugMesh = new THREE.Mesh(geometry, material);
-    // Posizionato in basso nel campo visivo, come un piccolo HUD
     debugMesh.position.set(0, -0.35, -0.9);
     debugMesh.renderOrder = 999;
     camera.add(debugMesh);
   }
 
-  function updateDebugHUD() {
+  function updateDebugHUD(delta) {
     if (!debugCtx) return;
+    debugUpdateTimer += delta;
+    if (debugUpdateTimer < DEBUG_UPDATE_INTERVAL) return;
+    debugUpdateTimer = 0;
+
     camera.getWorldPosition(debugWorldPos);
 
     debugCtx.clearRect(0, 0, 512, 256);
@@ -548,19 +555,12 @@
     }
   }
 
-  // Vettore riutilizzato per il blocco continuo dell'altezza in VR
   const currentWorldPos = new THREE.Vector3();
 
   function animate() {
     const delta = clock.getDelta();
 
     if (renderer.xr.isPresenting) {
-      // BLOCCO CONTINUO DELL'ALTEZZA: ad ogni singolo frame, misuriamo
-      // l'altezza reale della camera nel mondo e correggiamo dolly.position.y
-      // in modo che risulti SEMPRE esattamente floorY + EYE_HEIGHT.
-      // Questo funziona indipendentemente da come il visore/browser
-      // interpreta il reference space (local-floor, local, o fallback),
-      // perché non ci fidiamo di quel valore: lo forziamo ogni frame.
       camera.getWorldPosition(currentWorldPos);
       const heightError = (floorY + EYE_HEIGHT) - currentWorldPos.y;
       dolly.position.y += heightError;
@@ -568,7 +568,7 @@
       updateVRMovement(delta);
       updateControllerPointer(renderer.xr.getController(0));
       updateControllerPointer(renderer.xr.getController(1));
-      updateDebugHUD();
+      updateDebugHUD(delta);
     } else {
       updateKeyboardMovement(delta);
     }
