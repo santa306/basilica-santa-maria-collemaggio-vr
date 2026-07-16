@@ -298,6 +298,7 @@
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.xr.enabled = true;
+    renderer.xr.setReferenceSpaceType('local-floor');
     document.body.appendChild(renderer.domElement);
     document.body.appendChild(VRButton.createButton(renderer));
 
