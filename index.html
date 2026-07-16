@@ -57,7 +57,7 @@
   import { VRButton } from "three/addons/webxr/VRButton.js";
 
   let scene, camera, renderer, dolly, loadedModel;
-  const moveSpeed = 5; // metri al secondo (aumentata)
+  const moveSpeed = 5; // metri al secondo
   const clock = new THREE.Clock();
   const keys = { forward: false, backward: false, left: false, right: false };
 
@@ -81,11 +81,6 @@
   const mouseSensitivity = 0.0025;
   const PITCH_LIMIT = Math.PI / 2 - 0.05;
   const CLICK_DRAG_THRESHOLD = 5;
-
-  // --- Auto-calibrazione altezza VR ---
-  let vrHeightNeedsCalibration = false;
-  let vrCalibrationFramesElapsed = 0;
-  const VR_CALIBRATION_DELAY_FRAMES = 10; // aspetta ~10 frame prima di calibrare
 
   // --- Audio dei personaggi ---
   const audioFrancesco = new Audio("audio_francesco.m4a");
@@ -194,6 +189,49 @@
 
     line.scale.z = hitDistance / MAX_RAY_LENGTH;
     reticle.visible = intersects.length > 0;
+  }
+
+  // ============================================================
+  // --- Pannello di debug visibile DENTRO al visore ---
+  // Utile temporaneamente per capire i numeri reali se l'altezza
+  // dovesse ancora risultare sbagliata. Si può rimuovere in seguito.
+  // ============================================================
+  let debugCanvas, debugCtx, debugTexture, debugMesh;
+  const debugWorldPos = new THREE.Vector3();
+
+  function createDebugHUD() {
+    debugCanvas = document.createElement("canvas");
+    debugCanvas.width = 512;
+    debugCanvas.height = 256;
+    debugCtx = debugCanvas.getContext("2d");
+    debugTexture = new THREE.CanvasTexture(debugCanvas);
+    const material = new THREE.MeshBasicMaterial({
+      map: debugTexture, transparent: true, depthTest: false,
+    });
+    const geometry = new THREE.PlaneGeometry(0.55, 0.275);
+    debugMesh = new THREE.Mesh(geometry, material);
+    // Posizionato in basso nel campo visivo, come un piccolo HUD
+    debugMesh.position.set(0, -0.35, -0.9);
+    debugMesh.renderOrder = 999;
+    camera.add(debugMesh);
+  }
+
+  function updateDebugHUD() {
+    if (!debugCtx) return;
+    camera.getWorldPosition(debugWorldPos);
+
+    debugCtx.clearRect(0, 0, 512, 256);
+    debugCtx.fillStyle = "rgba(0,0,0,0.75)";
+    debugCtx.fillRect(0, 0, 512, 256);
+    debugCtx.fillStyle = "#ffffff";
+    debugCtx.font = "22px monospace";
+    debugCtx.fillText(`floorY: ${floorY.toFixed(2)}`, 20, 40);
+    debugCtx.fillText(`EYE_HEIGHT target: ${EYE_HEIGHT.toFixed(2)}`, 20, 75);
+    debugCtx.fillText(`target totale: ${(floorY + EYE_HEIGHT).toFixed(2)}`, 20, 110);
+    debugCtx.fillText(`camera world Y: ${debugWorldPos.y.toFixed(2)}`, 20, 145);
+    debugCtx.fillText(`dolly.y: ${dolly.position.y.toFixed(2)}`, 20, 180);
+    debugCtx.fillText(`XR presenting: ${renderer.xr.isPresenting}`, 20, 215);
+    debugTexture.needsUpdate = true;
   }
 
   // ============================================================
@@ -314,6 +352,8 @@
     dolly.add(camera);
     scene.add(dolly);
 
+    createDebugHUD();
+
     const hemiLight = new THREE.HemisphereLight(0x8fc7ee, 0x4a7c2a, 1.1);
     scene.add(hemiLight);
 
@@ -333,11 +373,6 @@
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.xr.enabled = true;
     renderer.xr.setReferenceSpaceType('local-floor');
-
-    renderer.xr.addEventListener('sessionstart', () => {
-      vrHeightNeedsCalibration = true;
-      vrCalibrationFramesElapsed = 0;
-    });
 
     document.body.appendChild(renderer.domElement);
     document.body.appendChild(VRButton.createButton(renderer));
@@ -513,23 +548,27 @@
     }
   }
 
+  // Vettore riutilizzato per il blocco continuo dell'altezza in VR
+  const currentWorldPos = new THREE.Vector3();
+
   function animate() {
     const delta = clock.getDelta();
 
     if (renderer.xr.isPresenting) {
-      if (vrHeightNeedsCalibration) {
-        vrCalibrationFramesElapsed++;
-        if (vrCalibrationFramesElapsed >= VR_CALIBRATION_DELAY_FRAMES) {
-          const measuredHeight = camera.position.y;
-          const correction = (floorY + EYE_HEIGHT) - measuredHeight;
-          dolly.position.y += correction;
-          vrHeightNeedsCalibration = false;
-        }
-      }
+      // BLOCCO CONTINUO DELL'ALTEZZA: ad ogni singolo frame, misuriamo
+      // l'altezza reale della camera nel mondo e correggiamo dolly.position.y
+      // in modo che risulti SEMPRE esattamente floorY + EYE_HEIGHT.
+      // Questo funziona indipendentemente da come il visore/browser
+      // interpreta il reference space (local-floor, local, o fallback),
+      // perché non ci fidiamo di quel valore: lo forziamo ogni frame.
+      camera.getWorldPosition(currentWorldPos);
+      const heightError = (floorY + EYE_HEIGHT) - currentWorldPos.y;
+      dolly.position.y += heightError;
 
       updateVRMovement(delta);
       updateControllerPointer(renderer.xr.getController(0));
       updateControllerPointer(renderer.xr.getController(1));
+      updateDebugHUD();
     } else {
       updateKeyboardMovement(delta);
     }
