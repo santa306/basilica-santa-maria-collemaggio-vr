@@ -57,19 +57,17 @@
   import { VRButton } from "three/addons/webxr/VRButton.js";
 
   let scene, camera, renderer, dolly, loadedModel;
-  const moveSpeed = 3; // metri al secondo
+  const moveSpeed = 5; // metri al secondo (aumentata)
   const clock = new THREE.Clock();
   const keys = { forward: false, backward: false, left: false, right: false };
 
   // --- Parametri regolabili per la posizione iniziale ---
-  const EYE_HEIGHT = 1.65;
+  const EYE_HEIGHT = 3;
   const DOOR_DISTANCE = 5;        // distanza dalla porta (asse X in questo modello)
   const DOOR_LATERAL_OFFSET = 4;  // spostamento laterale (asse Z in questo modello)
 
   const TREE_COUNT = 80;
 
-  // Altezza reale del pavimento virtuale (impostata dopo il caricamento del modello),
-  // serve anche per l'auto-calibrazione dell'altezza in VR
   let floorY = 0;
 
   // --- Stato per il controllo dello sguardo con mouse (click + trascina) ---
@@ -85,11 +83,9 @@
   const CLICK_DRAG_THRESHOLD = 5;
 
   // --- Auto-calibrazione altezza VR ---
-  // Molti visori, se il Guardian/pavimento non è mai stato configurato nella
-  // stanza, riportano un'altezza della testa inattendibile con 'local-floor'.
-  // Per essere robusti a questo, ricalibriamo l'altezza reale ogni volta che
-  // si entra in VR, usando la prima lettura della camera come riferimento.
   let vrHeightNeedsCalibration = false;
+  let vrCalibrationFramesElapsed = 0;
+  const VR_CALIBRATION_DELAY_FRAMES = 10; // aspetta ~10 frame prima di calibrare
 
   // --- Audio dei personaggi ---
   const audioFrancesco = new Audio("audio_francesco.m4a");
@@ -160,9 +156,6 @@
   // ============================================================
   // --- Puntatore laser visibile per i controller VR ---
   // ============================================================
-  // Senza questo, in VR non c'è alcun modo di vedere dove si sta puntando:
-  // creiamo una linea per ciascun controller, che si accorcia automaticamente
-  // fino al punto colpito (personaggio, facciata, terreno...).
   const MAX_RAY_LENGTH = 8;
 
   function createControllerPointer() {
@@ -341,10 +334,9 @@
     renderer.xr.enabled = true;
     renderer.xr.setReferenceSpaceType('local-floor');
 
-    // Ogni volta che si entra in VR, segna che serve ricalibrare l'altezza
-    // al prossimo frame utile (vedi animate())
     renderer.xr.addEventListener('sessionstart', () => {
       vrHeightNeedsCalibration = true;
+      vrCalibrationFramesElapsed = 0;
     });
 
     document.body.appendChild(renderer.domElement);
@@ -525,25 +517,17 @@
     const delta = clock.getDelta();
 
     if (renderer.xr.isPresenting) {
-      // Auto-calibrazione: al primo frame utile dopo l'ingresso in VR,
-      // forziamo l'altezza reale dell'utente a EYE_HEIGHT, indipendentemente
-      // da cosa riporta il visore (robusto anche se il Guardian/pavimento
-      // non è mai stato configurato nella stanza).
       if (vrHeightNeedsCalibration) {
-        dolly.position.y = floorY - camera.position.y + EYE_HEIGHT;
-        vrHeightNeedsCalibration = false;
+        vrCalibrationFramesElapsed++;
+        if (vrCalibrationFramesElapsed >= VR_CALIBRATION_DELAY_FRAMES) {
+          const measuredHeight = camera.position.y;
+          const correction = (floorY + EYE_HEIGHT) - measuredHeight;
+          dolly.position.y += correction;
+          vrHeightNeedsCalibration = false;
+        }
       }
 
       updateVRMovement(delta);
-
-      const session = renderer.xr.getSession();
-      if (session) {
-        for (const source of session.inputSources) {
-          if (source.targetRayMode === "tracked-pointer" && source.handedness) {
-            // aggiornato sotto tramite i controller registrati
-          }
-        }
-      }
       updateControllerPointer(renderer.xr.getController(0));
       updateControllerPointer(renderer.xr.getController(1));
     } else {
