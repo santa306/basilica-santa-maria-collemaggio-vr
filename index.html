@@ -192,56 +192,6 @@
   }
 
   // ============================================================
-  // --- Pannello di debug visibile DENTRO al visore ---
-  // OTTIMIZZATO: si aggiorna solo 4 volte al secondo (non ogni frame),
-  // perché ridisegnare il canvas e ricaricare la texture sulla GPU ad
-  // ogni frame in VR (90 volte al secondo, per due occhi) è costoso
-  // ed era la causa più probabile del lag.
-  // ============================================================
-  let debugCanvas, debugCtx, debugTexture, debugMesh;
-  const debugWorldPos = new THREE.Vector3();
-  let debugUpdateTimer = 0;
-  const DEBUG_UPDATE_INTERVAL = 0.25; // secondi tra un aggiornamento e l'altro
-
-  function createDebugHUD() {
-    debugCanvas = document.createElement("canvas");
-    debugCanvas.width = 512;
-    debugCanvas.height = 256;
-    debugCtx = debugCanvas.getContext("2d");
-    debugTexture = new THREE.CanvasTexture(debugCanvas);
-    const material = new THREE.MeshBasicMaterial({
-      map: debugTexture, transparent: true, depthTest: false,
-    });
-    const geometry = new THREE.PlaneGeometry(0.55, 0.275);
-    debugMesh = new THREE.Mesh(geometry, material);
-    debugMesh.position.set(0, -0.35, -0.9);
-    debugMesh.renderOrder = 999;
-    camera.add(debugMesh);
-  }
-
-  function updateDebugHUD(delta) {
-    if (!debugCtx) return;
-    debugUpdateTimer += delta;
-    if (debugUpdateTimer < DEBUG_UPDATE_INTERVAL) return;
-    debugUpdateTimer = 0;
-
-    camera.getWorldPosition(debugWorldPos);
-
-    debugCtx.clearRect(0, 0, 512, 256);
-    debugCtx.fillStyle = "rgba(0,0,0,0.75)";
-    debugCtx.fillRect(0, 0, 512, 256);
-    debugCtx.fillStyle = "#ffffff";
-    debugCtx.font = "22px monospace";
-    debugCtx.fillText(`floorY: ${floorY.toFixed(2)}`, 20, 40);
-    debugCtx.fillText(`EYE_HEIGHT target: ${EYE_HEIGHT.toFixed(2)}`, 20, 75);
-    debugCtx.fillText(`target totale: ${(floorY + EYE_HEIGHT).toFixed(2)}`, 20, 110);
-    debugCtx.fillText(`camera world Y: ${debugWorldPos.y.toFixed(2)}`, 20, 145);
-    debugCtx.fillText(`dolly.y: ${dolly.position.y.toFixed(2)}`, 20, 180);
-    debugCtx.fillText(`XR presenting: ${renderer.xr.isPresenting}`, 20, 215);
-    debugTexture.needsUpdate = true;
-  }
-
-  // ============================================================
   // --- Ambiente: alberi con InstancedMesh (alte performance) ---
   // ============================================================
   const TREE_TYPE_DEFS = [
@@ -358,8 +308,6 @@
     dolly = new THREE.Group();
     dolly.add(camera);
     scene.add(dolly);
-
-    createDebugHUD();
 
     const hemiLight = new THREE.HemisphereLight(0x8fc7ee, 0x4a7c2a, 1.1);
     scene.add(hemiLight);
@@ -568,7 +516,6 @@
       updateVRMovement(delta);
       updateControllerPointer(renderer.xr.getController(0));
       updateControllerPointer(renderer.xr.getController(1));
-      updateDebugHUD(delta);
     } else {
       updateKeyboardMovement(delta);
     }
